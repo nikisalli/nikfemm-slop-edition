@@ -5,68 +5,95 @@ namespace nikfemm {
         default_prop = {0, {0, 0}, magnetostatic_materials::air, {}};
     }
 
-    System<NonLinearExpression> MagnetostaticMesh::getFemSystem() {
-        System<NonLinearExpression> system(data.numberofpoints);
-        // since the stiffness matrix is symmetric, this function only computes the upper triangular part
+    MagnetostaticSystem MagnetostaticMesh::getFemSystem() {
+        MagnetostaticSystem system;
+        uint32_t n = data.numberofpoints;
+        uint32_t m = data.numberoftriangles;
+        system.n = n;
+        system.b = std::vector<double>(n, 0);
+        system.elem_stiffness.resize(m);
+        system.elem_entries.resize(m);
+        system.elem_area.resize(m);
 
         auto start = std::chrono::high_resolution_clock::now();
-
-        // COMPUTE FEM WEIGHTS
-        auto adjelems_ids = std::vector<std::array<uint32_t, 18>>(data.numberofpoints);
-        auto adjelems_props = std::vector<std::array<const MagnetostaticProp*, 18>>(data.numberofpoints);
-        auto adjelems_count = std::vector<uint8_t>(data.numberofpoints, 0);
-
-        for (uint32_t i = 0; i < data.numberoftriangles; i++) {
-            for (uint8_t j = 0; j < 3; j++) {
-                uint32_t myid = data.trianglelist[i][j];
-                adjelems_ids[myid][adjelems_count[myid]] = i;
-                adjelems_props[myid][adjelems_count[myid]++] = drawing.getRegionPtrFromId(data.triangleattributelist[i]);
-            }
-        }
 
         // the kelvin exterior region is assembled in its untransformed coordinates
         const Vector* points = fem_pointlist.size() == (size_t)data.numberofpoints ? fem_pointlist.data() : data.pointlist;
 
-        // surface integral
-        for (uint32_t i = 0; i < data.numberofpoints; i++) {
-            for (uint8_t j = 0; j < adjelems_count[i]; j++) {
-                uint32_t v1, v2, v3;
-                v1 = i;
-                Elem myelem = data.trianglelist[adjelems_ids[i][j]];
-                if (i == data.trianglelist[adjelems_ids[i][j]][0]) {
-                    v2 = myelem[1];
-                    v3 = myelem[2];
-                } else if (i == myelem[1]) {
-                    v2 = myelem[2];
-                    v3 = myelem[0];
-                } else if (i == myelem[2]) {
-                    v2 = myelem[0];
-                    v3 = myelem[1];
-                } else {
-                    nexit("error: vertex not found in element");
-                }
+        // surface integral, element by element
+        for (uint32_t e = 0; e < m; e++) {
+            Elem myelem = data.trianglelist[e];
+            Vector p0 = points[myelem[0]];
+            Vector p1 = points[myelem[1]];
+            Vector p2 = points[myelem[2]];
+            double area = fabs((p1 - p0) ^ (p2 - p0)) / 2;
 
-                double double_oriented_area = (points[v2] - points[v1]) ^ (points[v3] - points[v1]);
+            // gradients of the shape functions times twice the area, the sign doesn't matter in the products
+            double b[3] = {p1.y - p2.y, p2.y - p0.y, p0.y - p1.y};
+            double c[3] = {p2.x - p1.x, p0.x - p2.x, p1.x - p0.x};
+            for (uint8_t k = 0; k < 6; k++) {
+                uint8_t i = MagnetostaticSystem::elem_entry_nodes[k][0];
+                uint8_t j = MagnetostaticSystem::elem_entry_nodes[k][1];
+                system.elem_stiffness[e][k] = (b[i] * b[j] + c[i] * c[j]) / (4 * area);
+            }
+            system.elem_area[e] = area;
 
-                if (double_oriented_area < 0) {
-                    std::swap(v2, v3);
-                }
+            // set the b vector
+            double J = drawing.getRegionPtrFromId(data.triangleattributelist[e])->J;
+            for (uint8_t i = 0; i < 3; i++) {
+                system.b[myelem[i]] += J * area / 3;
+            }
+        }
 
-                double double_area = (points[v2] - points[v1]) ^ (points[v3] - points[v1]);
+        // sparsity pattern of the upper triangle: for every column, the rows of its entries
+        // every column gets its diagonal even if no element touches the node
+        std::vector<int> col_count(n + 1, 0);
+        for (uint32_t e = 0; e < m; e++) {
+            Elem myelem = data.trianglelist[e];
+            for (uint8_t k = 0; k < 6; k++) {
+                int col = std::max(myelem[MagnetostaticSystem::elem_entry_nodes[k][0]], myelem[MagnetostaticSystem::elem_entry_nodes[k][1]]);
+                col_count[col + 1]++;
+            }
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            col_count[i + 1]++;
+            col_count[i + 1] += col_count[i];
+        }
+        std::vector<int> candidate_rows(col_count[n]);
+        std::vector<int> cursor(col_count.begin(), col_count.end() - 1);
+        for (uint32_t i = 0; i < n; i++) {
+            candidate_rows[cursor[i]++] = i;
+        }
+        for (uint32_t e = 0; e < m; e++) {
+            Elem myelem = data.trianglelist[e];
+            for (uint8_t k = 0; k < 6; k++) {
+                int v1 = myelem[MagnetostaticSystem::elem_entry_nodes[k][0]];
+                int v2 = myelem[MagnetostaticSystem::elem_entry_nodes[k][1]];
+                candidate_rows[cursor[std::max(v1, v2)]++] = std::min(v1, v2);
+            }
+        }
+        system.col_ptr = std::vector<int>(n + 1, 0);
+        system.row_ind.reserve(col_count[n] / 2);
+        for (uint32_t j = 0; j < n; j++) {
+            auto first = candidate_rows.begin() + col_count[j];
+            auto last = candidate_rows.begin() + col_count[j + 1];
+            std::sort(first, last);
+            last = std::unique(first, last);
+            system.row_ind.insert(system.row_ind.end(), first, last);
+            system.col_ptr[j + 1] = system.row_ind.size();
+        }
 
-                // elements are only added if they are in the upper triangle because the matrix is symmetric and this saves half the memory
-                double b1 = (points[v2].y - points[v3].y) / double_area;
-                double c1 = (points[v3].x - points[v2].x) / double_area;
-                double b2 = (points[v3].y - points[v1].y) / double_area;
-                double c2 = (points[v1].x - points[v3].x) / double_area;
-                double b3 = (points[v1].y - points[v2].y) / double_area;
-                double c3 = (points[v2].x - points[v1].x) / double_area;
-                if (v1 >= i) system.A(i, v1) += NonLinearTerm({double_area * (b1 * b1 + c1 * c1) * 0.5, adjelems_ids[i][j]});
-                if (v2 >= i) system.A(i, v2) += NonLinearTerm({double_area * (b2 * b1 + c2 * c1) * 0.5, adjelems_ids[i][j]});
-                if (v3 >= i) system.A(i, v3) += NonLinearTerm({double_area * (b3 * b1 + c3 * c1) * 0.5, adjelems_ids[i][j]});
-
-                // set the b vector
-                system.b[i] += (double_area * adjelems_props[i][j]->J) / 6;
+        // position of every element entry in the sparse matrix
+        for (uint32_t e = 0; e < m; e++) {
+            Elem myelem = data.trianglelist[e];
+            for (uint8_t k = 0; k < 6; k++) {
+                int v1 = myelem[MagnetostaticSystem::elem_entry_nodes[k][0]];
+                int v2 = myelem[MagnetostaticSystem::elem_entry_nodes[k][1]];
+                int row = std::min(v1, v2);
+                int col = std::max(v1, v2);
+                auto first = system.row_ind.begin() + system.col_ptr[col];
+                auto last = system.row_ind.begin() + system.col_ptr[col + 1];
+                system.elem_entries[e][k] = std::lower_bound(first, last, row) - system.row_ind.begin();
             }
         }
 
@@ -141,53 +168,31 @@ namespace nikfemm {
 
         // now we have to find the edges that are subject to a surface current
         // i.e. the edges that lie on a segment that is subject to a surface current
-        // edges should be unique
-
-        // we need an unique list of edges
-        struct Edge {
-            uint32_t v1, v2;
+        // these can only be subsegments of the drawing segments, which triangle outputs as a unique list
+        double tolerance = epsilon * 0.1;
+        // a point within the tolerance of a segment is inside the bounding box of the segment grown by the tolerance
+        auto inSegmentBox = [tolerance](Vector p, const SurfaceCurrentSegment& s) {
+            return p.x >= std::min(s.p1.x, s.p2.x) - tolerance && p.x <= std::max(s.p1.x, s.p2.x) + tolerance &&
+                   p.y >= std::min(s.p1.y, s.p2.y) - tolerance && p.y <= std::max(s.p1.y, s.p2.y) + tolerance;
         };
-
-        struct EdgeHash {
-            static uint64_t edge_unique_hash(uint32_t v1, uint32_t v2) {
-                return (uint64_t)v1 << 32 | (uint64_t)v2;
-            }
-            std::size_t operator()(const Edge& edge) const {
-                return edge_unique_hash(edge.v1, edge.v2) * (edge.v1 > edge.v2) + edge_unique_hash(edge.v2, edge.v1) * (edge.v1 <= edge.v2);
-            }
-        };
-
-        struct EdgeEqual {
-            bool operator()(const Edge& edge1, const Edge& edge2) const {
-                return (edge1.v1 == edge2.v1 && edge1.v2 == edge2.v2) || (edge1.v1 == edge2.v2 && edge1.v2 == edge2.v1);
-            }
-        };
-
-        std::unordered_set<Edge, EdgeHash, EdgeEqual> edges;
-        edges.reserve((data.numberofpoints - 2) * 3);
-
-        for (uint32_t i = 0; i < data.numberoftriangles; i++) {
-            edges.insert({(uint32_t)data.trianglelist[i][0], (uint32_t)data.trianglelist[i][1]});
-            edges.insert({(uint32_t)data.trianglelist[i][1], (uint32_t)data.trianglelist[i][2]});
-            edges.insert({(uint32_t)data.trianglelist[i][2], (uint32_t)data.trianglelist[i][0]});
-        }
-
-        nloginfo("number of edges: %d, predicted number of edges: %d", edges.size(), (data.numberofpoints - 2) * 3);
-        
-
-        for (auto edge : edges) {
-            Vector p1 = data.pointlist[edge.v1];
-            Vector p2 = data.pointlist[edge.v2];
-            for (auto magnet : magnets) {
-                for (auto segment : magnet.segments) {
+        for (int s = 0; s < data.numberofsegments; s++) {
+            uint32_t v1 = data.segmentlist[2 * s];
+            uint32_t v2 = data.segmentlist[2 * s + 1];
+            Vector p1 = data.pointlist[v1];
+            Vector p2 = data.pointlist[v2];
+            for (auto& magnet : magnets) {
+                for (auto& segment : magnet.segments) {
+                    if (!inSegmentBox(p1, segment) || !inSegmentBox(p2, segment)) {
+                        continue;
+                    }
                     double dist1 = Segment::pointSegmentDistance(p1, segment.p1, segment.p2);
                     double dist2 = Segment::pointSegmentDistance(p2, segment.p1, segment.p2);
-                    if (dist1 < epsilon * 0.1 && dist2 < epsilon * 0.1) {
+                    if (dist1 < tolerance && dist2 < tolerance) {
                         // this edge is subject to a surface current
                         // the integral of a linear shape function over the edge is length / 2
                         double length = Vector::distance(p1, p2);
-                        system.b[edge.v1] += length * segment.Jm * 0.5;
-                        system.b[edge.v2] += length * segment.Jm * 0.5;
+                        system.b[v1] += length * segment.Jm * 0.5;
+                        system.b[v2] += length * segment.Jm * 0.5;
                     }
                 }
             }
@@ -200,7 +205,7 @@ namespace nikfemm {
         return system;
     }
 
-    void MagnetostaticMesh::addDirichletInfiniteBoundaryConditions(System<NonLinearExpression>& system) {
+    void MagnetostaticMesh::addDirichletInfiniteBoundaryConditions(MagnetostaticSystem& system) {
         // with the kelvin exterior region the potential is zero at infinity, i.e. at the center of the kelvin disk
         if (kelvin_center_point >= 0) {
             system.addDirichletBoundaryCondition(kelvin_center_point, 0);

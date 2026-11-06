@@ -2,6 +2,7 @@
 #define NIK_MAGNETOSTATIC_PROPERTIES_HPP
 
 #include <set>
+#include <vector>
 
 #include "../geometry/vector.hpp"
 
@@ -31,6 +32,26 @@ struct std::equal_to<nikfemm::BH_Point> {
 
 namespace nikfemm {
     typedef std::set<BH_Point> BH_Curve;
+
+    // smooth interpolation of a BH curve, same as femm: H(B) is a cubic hermite spline through the curve points
+    // and the origin, extrapolated linearly past the last point. if the spline is not monotonic the points
+    // are smoothed until it is
+    struct BHSpline {
+        std::vector<double> B;
+        std::vector<double> H;
+        std::vector<double> slope;  // dH/dB at the points
+
+        BHSpline() {}
+        BHSpline(const BH_Curve& curve);
+        double getH(double b) const;
+        double getdHdB(double b) const;
+        // reluctivity nu = H / B and its derivative with respect to B^2
+        void getNu(double B2, double& nu, double& dnu_dB2) const;
+
+        private:
+        void computeSlopes();
+        void evaluate(double b, double& h, double& dhdb) const;
+    };
 
     typedef double MaxwellStressTensor[2][2];
 

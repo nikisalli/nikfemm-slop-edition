@@ -9,6 +9,10 @@
 #include <iterator>
 #include <set>
 
+// before the nikfemm headers, they define macros like PI
+#include <Eigen/Sparse>
+#include <Eigen/SparseCholesky>
+
 #include "../constants.hpp"
 #include "simulation.hpp"
 #include "../drawing/drawing.hpp"
@@ -20,23 +24,7 @@
 #include "../algebra/math.hpp"
 
 namespace nikfemm {
-    void MagnetostaticSimulation::updateMu(const std::vector<Vector>& B, std::vector<const MagnetostaticProp*>& props, std::vector<double>& mu, double relaxation) {
-        assert(mu.size() == B.size());
-
-        for (uint32_t i = 0; i < B.size(); i++) {
-            double Bmag = B[i].norm();
-            if (props[i]->isLinear()) {
-                mu[i] = props[i]->getMu(Bmag);
-            } else {
-                // relax the reluctivity because the stiffness matrix is linear in it
-                double nu_old = 1 / mu[i];
-                double nu_new = 1 / props[i]->getMu(Bmag);
-                mu[i] = 1 / (nu_old + (nu_new - nu_old) * relaxation);
-            }
-        }
-    }
-
-    System<NonLinearExpression> MagnetostaticSimulation::generateSystem(bool refine, double max_triangle_area, int min_angle, bool refine_magnets) {
+    MagnetostaticSystem MagnetostaticSimulation::generateSystem(bool refine, double max_triangle_area, int min_angle, bool refine_magnets) {
         // get time in milliseconds
 
         /* auto boundary */
@@ -83,100 +71,180 @@ namespace nikfemm {
         return system;
     }
 
-    std::vector<double> MagnetostaticSimulation::solve(System<NonLinearExpression>& system) {
-        auto A = std::vector<double>(mesh.data.numberofpoints);
-        auto B = std::vector<Vector>(mesh.data.numberoftriangles, {0, 0});
-        std::vector<double> mu(mesh.data.numberoftriangles, 0);
-        std::vector<const MagnetostaticProp*> props(mesh.data.numberoftriangles);
+    std::vector<double> MagnetostaticSimulation::solve(MagnetostaticSystem& system) {
+        typedef Eigen::SparseMatrix<double> SparseMatrix;
+        const uint32_t n = system.n;
+        const uint32_t m = mesh.data.numberoftriangles;
+        const uint32_t nnz = system.row_ind.size();
+        auto A = std::vector<double>(n, 0);
 
-        // fill props
-        for (uint32_t i = 0; i < mesh.data.numberoftriangles; i++) {
-            props[i] = mesh.drawing.getRegionPtrFromId(mesh.data.triangleattributelist[i]);
-        }
-
-        NonLinearMatCSRSymmetric FemMat(system.A);
-        std::vector<double> b(system.b.size());
-
-        // initialize mu
-        for (uint32_t i = 0; i < B.size(); i++) {
-            mu[i] = props[i]->getMu(0);
-        }
-        FemMat.evaluate(mu);
-        for (uint32_t i = 0; i < system.b.size(); i++) {
-            b[i] = system.b[i].evaluate(mu);
-        }
-
-        // check if magnetostatic_materials are all linear
+        // reluctivity of the linear elements, the nonlinear ones share the smooth BH curve of their material
+        std::vector<double> elem_nu(m, 0);
+        std::vector<int32_t> elem_spline(m, -1);
+        std::vector<BHSpline> splines;
+        std::unordered_map<const MagnetostaticProp*, int32_t> spline_ids;
         bool all_linear = true;
-        for (uint32_t i = 0; i < props.size(); i++) {
-            if (!props[i]->isLinear()) {
+        for (uint32_t e = 0; e < m; e++) {
+            const MagnetostaticProp* prop = mesh.drawing.getRegionPtrFromId(mesh.data.triangleattributelist[e]);
+            if (prop->isLinear()) {
+                elem_nu[e] = 1 / prop->mu;
+            } else {
                 all_linear = false;
-                break;
+                auto it = spline_ids.find(prop);
+                if (it == spline_ids.end()) {
+                    it = spline_ids.emplace(prop, splines.size()).first;
+                    splines.emplace_back(prop->bh_curve);
+                }
+                elem_spline[e] = it->second;
             }
         }
 
-        // the tolerances are relative to the norm of the source vector so that they don't depend on the units
-        double b_norm = norm(b);
-        if (b_norm == 0) {
+        // dirichlet nodes keep their value, the newton updates only move the free nodes
+        std::vector<bool> fixed(n, false);
+        for (uint32_t i = 0; i < system.dirichlet_nodes.size(); i++) {
+            fixed[system.dirichlet_nodes[i]] = true;
+            A[system.dirichlet_nodes[i]] = system.dirichlet_values[i];
+        }
+        // entries in the rows and columns of the dirichlet nodes, they are replaced by the identity
+        std::vector<int> fixed_entries;
+        for (uint32_t j = 0; j < n; j++) {
+            for (int k = system.col_ptr[j]; k < system.col_ptr[j + 1]; k++) {
+                if (fixed[j] || fixed[system.row_ind[k]]) {
+                    fixed_entries.push_back(k);
+                }
+            }
+        }
+
+        // stiffness matrix (the jacobian for nonlinear problems) with the sparsity pattern of the system
+        SparseMatrix K(n, n);
+        K.resizeNonZeros(nnz);
+        std::copy(system.col_ptr.begin(), system.col_ptr.end(), K.outerIndexPtr());
+        std::copy(system.row_ind.begin(), system.row_ind.end(), K.innerIndexPtr());
+        double* K_val = K.valuePtr();
+
+        // residual r = b - K(A) A and, if requested, its jacobian with the opposite sign in K
+        auto assemble = [&](const std::vector<double>& A, std::vector<double>& r, bool jacobian) {
+            std::copy(system.b.begin(), system.b.end(), r.begin());
+            if (jacobian) {
+                std::fill(K_val, K_val + nnz, 0.0);
+            }
+            for (uint32_t e = 0; e < m; e++) {
+                Elem myelem = mesh.data.trianglelist[e];
+                const auto& S = system.elem_stiffness[e];
+                double a[3] = {A[myelem[0]], A[myelem[1]], A[myelem[2]]};
+                double SA[3] = {S[0] * a[0] + S[1] * a[1] + S[2] * a[2],
+                                S[1] * a[0] + S[3] * a[1] + S[4] * a[2],
+                                S[2] * a[0] + S[4] * a[1] + S[5] * a[2]};
+                double nu = elem_nu[e];
+                double dnu_dB2 = 0;
+                if (elem_spline[e] >= 0) {
+                    // A^T S A = area * B^2
+                    double B2 = (a[0] * SA[0] + a[1] * SA[1] + a[2] * SA[2]) / system.elem_area[e];
+                    splines[elem_spline[e]].getNu(B2, nu, dnu_dB2);
+                }
+                for (uint8_t i = 0; i < 3; i++) {
+                    r[myelem[i]] -= nu * SA[i];
+                }
+                if (jacobian) {
+                    // d(nu S A)/dA = nu S + 2 dnu/dB^2 (S A) (S A)^T / area
+                    double w = 2 * dnu_dB2 / system.elem_area[e];
+                    for (uint8_t k = 0; k < 6; k++) {
+                        uint8_t i = MagnetostaticSystem::elem_entry_nodes[k][0];
+                        uint8_t j = MagnetostaticSystem::elem_entry_nodes[k][1];
+                        K_val[system.elem_entries[e][k]] += nu * S[k] + w * SA[i] * SA[j];
+                    }
+                }
+            }
+            for (auto node : system.dirichlet_nodes) {
+                r[node] = 0;
+            }
+            if (jacobian) {
+                for (int k : fixed_entries) {
+                    K_val[k] = 0;
+                }
+                for (auto node : system.dirichlet_nodes) {
+                    K_val[system.col_ptr[node + 1] - 1] = 1;
+                }
+            }
+        };
+
+        auto tstart = std::chrono::high_resolution_clock::now();
+        std::vector<double> r(n);
+        assemble(A, r, true);
+
+        // the tolerance is relative to the norm of the sources so that it doesn't depend on the units
+        double ref_norm = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!fixed[i]) ref_norm += system.b[i] * system.b[i];
+        }
+        ref_norm = sqrt(ref_norm);
+        if (ref_norm == 0) {
+            // no sources, only the dirichlet values drive the solution
+            ref_norm = norm(r);
+        }
+        if (ref_norm == 0) {
             nloginfo("no sources, the solution is zero");
             return A;
         }
+        double residual = norm(r) / ref_norm;
 
-        auto tstart = std::chrono::high_resolution_clock::now();
+        Eigen::SimplicialLDLT<SparseMatrix, Eigen::Upper> ldlt;
+        ldlt.analyzePattern(K);
+
         if (all_linear) {
             nloginfo("all magnetostatic_materials are linear");
-            preconditionedSSORConjugateGradientSolver(FemMat, b, A, 1.5, 1e-10 * b_norm, 100000);
-            // preconditionedIncompleteCholeskyConjugateGradientSolver(FemMat, b, A, 1e-6, 100000);
         } else {
-            nloginfo("nonlinear magnetostatic_materials detected, starting non linear fixed point solver");
-            std::vector<double> r(system.b.size());  // residual
+            nloginfo("nonlinear magnetostatic_materials detected, starting newton solver");
+        }
+        std::vector<double> r_trial(n);
+        std::vector<double> A_trial(n);
+        bool converged = false;
+        for (uint32_t i = 0; i < 50; i++) {
+            ldlt.factorize(K);
+            if (ldlt.info() != Eigen::Success) {
+                nexit("error: the stiffness matrix could not be factorized");
+            }
+            Eigen::VectorXd delta = ldlt.solve(Eigen::Map<Eigen::VectorXd>(r.data(), n));
 
-            double residual = std::numeric_limits<double>::infinity();
-            double last_residual = std::numeric_limits<double>::infinity();
-            double relaxation = 1;
-            bool converged = false;
-            for (uint32_t i = 0; i < 500; i++) {
-                // the linear solve is allowed to be inexact, the outer iterations take care of the remaining error
-                preconditionedSSORConjugateGradientSolver(FemMat, b, A, 1.5, 1e-10 * b_norm, 50);
-
-                B = mesh.computeCurl(A);
-
-                MagnetostaticSimulation::updateMu(B, props, mu, relaxation);
-                FemMat.evaluate(mu);
-                for (uint32_t i = 0; i < system.b.size(); i++) {
-                    b[i] = system.b[i].evaluate(mu);
+            if (all_linear) {
+                // the residual is linear in A, one step solves the system
+                for (uint32_t j = 0; j < n; j++) {
+                    A[j] += delta[j];
                 }
+                converged = true;
+                break;
+            }
 
-                // relative residual of the system assembled with the updated permeabilities
-                mult(r, FemMat, A);
-                sub(r, b, r);
-                residual = norm(r) / b_norm;
-                nloginfo("nonlinear iteration %d, relative residual: %.17g, relaxation: %.3f", i, residual, relaxation);
-                if (residual < 1e-8) {
-                    nloginfo("Converged in %d iterations", i);
-                    converged = true;
+            // backtracking line search on the norm of the residual, the jacobian is assembled at every trial
+            // so that it is ready for the next iteration
+            double step = 1;
+            double trial_residual = residual;
+            for (uint32_t k = 0; k < 10; k++) {
+                for (uint32_t j = 0; j < n; j++) {
+                    A_trial[j] = A[j] + step * delta[j];
+                }
+                assemble(A_trial, r_trial, true);
+                trial_residual = norm(r_trial) / ref_norm;
+                if (trial_residual < residual) {
                     break;
                 }
-
-                // adaptive relaxation, same scheme as femm
-                if (i > 5) {
-                    if (residual > last_residual && relaxation > 0.1) {
-                        relaxation /= 2;
-                    } else {
-                        relaxation += 0.1 * (1 - relaxation);
-                    }
-                }
-                last_residual = residual;
-                fflush(stdout);
+                step /= 2;
             }
-            if (!converged) {
-                nlogwarn("nonlinear solver did not converge, last relative residual: %.17g", residual);
+            A.swap(A_trial);
+            r.swap(r_trial);
+            residual = trial_residual;
+            nloginfo("newton iteration %u, relative residual: %.17g, step: %g", i, residual, step);
+            if (residual < 1e-10) {
+                nloginfo("Converged in %u iterations", i + 1);
+                converged = true;
+                break;
             }
+        }
+        if (!converged) {
+            nlogwarn("nonlinear solver did not converge, last relative residual: %.17g", residual);
         }
         auto tend = std::chrono::high_resolution_clock::now();
         nloginfo("solver took %f ms", std::chrono::duration_cast<std::chrono::microseconds>(tend - tstart).count() / 1000.0);
-
-        // mesh.computeCurl(B, A);
 
         return A;
     }

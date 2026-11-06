@@ -40,15 +40,14 @@ namespace nikfemm {
             MagnetostaticMesh mesh;
             double depth = 1.0;
 
-            System<NonLinearExpression> generateSystem(bool refine = true, double max_triangle_area = 1, int min_angle = 33, bool refine_magnets = false);
-            std::vector<double> solve(System<NonLinearExpression>& system);
+            MagnetostaticSystem generateSystem(bool refine = true, double max_triangle_area = 1, int min_angle = 33, bool refine_magnets = false);
+            std::vector<double> solve(MagnetostaticSystem& system);
             Vector computeForceIntegrals(std::vector<Vector> B, Vector p);
             double computeTorqueIntegral(std::vector<Vector> B, Vector p, Vector center);
             StressTensor computeStressIntegral(std::vector<Vector> B, Vector p, Vector center);
             Vector computeForceIntegrals(std::vector<Vector> B, SurroundingRegionBlockIntegralAssets assets, Vector p);
             double computeTorqueIntegral(std::vector<Vector> B, SurroundingRegionBlockIntegralAssets assets, Vector p, Vector center);
         protected:
-            static void updateMu(const std::vector<Vector>& B, std::vector<const MagnetostaticProp*>& props, std::vector<double>& mu, double relaxation);
             auto getSurroundingRegionBlockIntegralAssets(std::vector<Vector> B, Vector p);
     };
 }

@@ -2,6 +2,8 @@
 a 2d physics simulator written in C++ from scratch
 
 # how to test it
+install [Eigen](https://eigen.tuxfamily.org) 3.4 or newer (header only, used for the sparse direct solver), e.g. ``` pacman -S eigen ``` or ``` apt install libeigen3-dev ```
+
 clone the repo first:
 
 ``` git clone https://github.com/nikisalli/nikfemm.git ```

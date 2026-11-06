@@ -17,15 +17,15 @@
 #include "../mesh/mesh.hpp"
 #include "../algebra/coo.hpp"
 #include "../algebra/system.hpp"
-#include "../algebra/non_linear.hpp"
+#include "system.hpp"
 #include "properties.hpp"
 
 namespace nikfemm {
     struct MagnetostaticMesh : Mesh<MagnetostaticProp> {
         MagnetostaticMesh();
 
-        System<NonLinearExpression> getFemSystem();
-        void addDirichletInfiniteBoundaryConditions(System<NonLinearExpression>& system);
+        MagnetostaticSystem getFemSystem();
+        void addDirichletInfiniteBoundaryConditions(MagnetostaticSystem& system);
         void refineMeshAroundMagnets();
     };
 }

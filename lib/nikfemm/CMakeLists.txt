@@ -20,6 +20,11 @@ include_directories("${NIKFEMM_INCLUDE_DIR}")
 add_library(nikfemm SHARED ${NIKFEMM_SRCS} ${NIKFEMM_INCLUDE_DIR})
 add_library(nikfemm_static STATIC ${NIKFEMM_SRCS} ${NIKFEMM_INCLUDE_DIR})
 
+# sparse direct solver of the magnetostatic simulation (header only, used privately by the library sources)
+find_package(Eigen3 REQUIRED NO_MODULE)
+target_link_libraries(nikfemm Eigen3::Eigen)
+target_link_libraries(nikfemm_static Eigen3::Eigen)
+
 # add opencv if NIKFEMM_USE_OPENCV option is set
 if(NOT DEFINED NIKFEMM_USE_OPENCV)
     set(NIKFEMM_USE_OPENCV ON)

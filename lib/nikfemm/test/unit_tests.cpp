@@ -407,6 +407,29 @@ namespace {
         return bt / w;
     }
 
+    // smooth saturating BH curve used to generate test data
+    double analyticH(double B) {
+        return 300 * B + 0.5 * (exp(B / 0.2) - 1);
+    }
+
+    double analyticB(double H) {
+        double lo = 0, hi = 5;
+        for (int i = 0; i < 200; i++) {
+            double mid = (lo + hi) / 2;
+            (analyticH(mid) < H ? lo : hi) = mid;
+        }
+        return (lo + hi) / 2;
+    }
+
+    // points evenly spaced in B, dense enough for the cubic spline to stay monotonic without smoothing
+    BH_Curve analyticCurve() {
+        BH_Curve curve;
+        for (int i = 1; i <= 24; i++) {
+            curve.insert({0.1 * i, analyticH(0.1 * i)});
+        }
+        return curve;
+    }
+
     // coaxial cable: inner conductor +I, gap material, outer return conductor -I
     // by symmetry H = I / (2 pi r) in the gap whatever the material is
     std::vector<Vector> solveCoax(MagnetostaticSimulation& sim, MagnetostaticProp gap, double I) {
@@ -464,14 +487,40 @@ BOOST_AUTO_TEST_CASE( magnetostatic_coax_linear )
 
 BOOST_AUTO_TEST_CASE( magnetostatic_coax_nonlinear )
 {
-    // B in the gap must follow the BH curve at H = I / (2 pi r), the radii avoid the corners of the piecewise linear curve
+    // B in the gap must follow the BH curve at H = I / (2 pi r)
+    // the curve is a dense sampling of an analytic one, so the expected values don't depend on the interpolation
     double I = 400;
     MagnetostaticSimulation sim;
-    auto B = solveCoax(sim, {0, {0, 0}, 0, magnetostatic_materials::iron}, I);
+    auto B = solveCoax(sim, {0, {0, 0}, 0, analyticCurve()}, I);
     for (double r : {0.016, 0.02, 0.025}) {
         double H = I / (2 * PI * r);
-        double Bexpected = H < 2000 ? H / 2000 : (H < 5000 ? 1 + 0.42 * (H - 2000) / 3000 : 1.42 + 0.28 * (H - 5000) / 5000);
-        BOOST_CHECK_CLOSE(ringAverageBtheta(sim, B, {0, 0}, r, 0.001), Bexpected, 0.5);
+        BOOST_CHECK_CLOSE(ringAverageBtheta(sim, B, {0, 0}, r, 0.001), analyticB(H), 0.5);
+    }
+}
+
+BOOST_AUTO_TEST_CASE( magnetostatic_bh_spline )
+{
+    // a smooth monotonic curve is interpolated exactly at its points
+    BH_Curve curve = analyticCurve();
+    BHSpline spline(curve);
+    for (auto& p : curve) {
+        BOOST_CHECK_CLOSE(spline.getH(p.B), p.H, 1e-9);
+    }
+
+    // the derivative of the reluctivity with respect to B^2 matches finite differences
+    for (double b : {0.3, 1.0, 1.5, 1.7}) {
+        double nu, dnu, nu1, nu2, tmp;
+        spline.getNu(b * b, nu, dnu);
+        double h = 1e-6;
+        spline.getNu(b * b + h, nu1, tmp);
+        spline.getNu(b * b - h, nu2, tmp);
+        BOOST_CHECK_CLOSE(dnu, (nu1 - nu2) / (2 * h), 1e-3);
+    }
+
+    // the built-in curve is too coarse for a cubic spline, after smoothing H(B) must still be increasing
+    BHSpline iron(magnetostatic_materials::iron);
+    for (double b = 0; b < 2.5; b += 0.001) {
+        BOOST_CHECK_GT(iron.getdHdB(b), 0);
     }
 }
 
