@@ -39,6 +39,9 @@ namespace nikfemm {
         public:
             MagnetostaticMesh mesh;
             double depth = 1.0;
+            // x is the radius and y the axial coordinate, the result is the azimuthal vector potential A_phi
+            // and J is the azimuthal current density, depth is not used
+            bool axisymmetric = false;
 
             MagnetostaticSystem generateSystem(bool refine = true, double max_triangle_area = 1, int min_angle = 33, bool refine_magnets = false);
             std::vector<double> solve(MagnetostaticSystem& system);

@@ -27,27 +27,77 @@ namespace nikfemm {
     MagnetostaticSystem MagnetostaticSimulation::generateSystem(bool refine, double max_triangle_area, int min_angle, bool refine_magnets) {
         // get time in milliseconds
 
-        /* auto boundary */
-        // find smallest enclosing circle using Welzl's algorithm
-        // Circle smallest_circle = Circle::getMinimumEnclosingCircle(mesh.drawing.points);
-        Circle smallest_circle = Circle::getEnclosingCircle(mesh.drawing.points);
-        if (mesh.drawing.points.size() == 0) {
-            smallest_circle.radius = 1;
-        }
+        mesh.axisymmetric = axisymmetric;
         double coeff = 1.5;  // make the circle [coeff] times the size of the smallest circle
-        // set simulation offset and boundary radius
-        mesh.center = smallest_circle.center;
-        mesh.radius = smallest_circle.radius * coeff;
-        // translate everything to the origin
-        mesh.drawing.translate(-mesh.center);
-        // make circle double the size of the smallest circle
-        Circle boundary_circle = Circle(Vector(0, 0), smallest_circle.radius * coeff);
-        double circumferential_length = boundary_circle.circumference();
-        uint32_t boundary_points = (uint32_t)((circumferential_length / sqrt((max_triangle_area * 4) / sqrt(3))) * 2);
-        nloginfo("boundary points: %d", boundary_points);
-        mesh.drawing.drawCircle(boundary_circle, boundary_points);
+        // spacing of the boundary points
+        double boundary_spacing = sqrt((max_triangle_area * 4) / sqrt(3)) / 2;
+
+        if (!axisymmetric) {
+            /* auto boundary */
+            // find smallest enclosing circle using Welzl's algorithm
+            // Circle smallest_circle = Circle::getMinimumEnclosingCircle(mesh.drawing.points);
+            Circle smallest_circle = Circle::getEnclosingCircle(mesh.drawing.points);
+            if (mesh.drawing.points.size() == 0) {
+                smallest_circle.radius = 1;
+            }
+            // set simulation offset and boundary radius
+            mesh.center = smallest_circle.center;
+            mesh.radius = smallest_circle.radius * coeff;
+            // translate everything to the origin
+            mesh.drawing.translate(-mesh.center);
+            // make circle double the size of the smallest circle
+            Circle boundary_circle = Circle(Vector(0, 0), smallest_circle.radius * coeff);
+            uint32_t boundary_points = (uint32_t)(boundary_circle.circumference() / boundary_spacing);
+            nloginfo("boundary points: %d", boundary_points);
+            mesh.drawing.drawCircle(boundary_circle, boundary_points);
+        } else {
+            // x is the radius and y the axial coordinate, the symmetry axis is x = 0
+            // the boundary is a half circle centered on the axis, closed by the axis itself
+            double z_min = std::numeric_limits<double>::infinity();
+            double z_max = -std::numeric_limits<double>::infinity();
+            for (auto& p : mesh.drawing.points) {
+                if (p.x < 0) {
+                    nexit("error: axisymmetric problems cannot have points with negative radius (x < 0)");
+                }
+                z_min = std::min(z_min, p.y);
+                z_max = std::max(z_max, p.y);
+            }
+            mesh.center = mesh.drawing.points.size() ? Vector(0, (z_min + z_max) / 2) : Vector(0, 0);
+            double enclosing_radius = 0;
+            for (auto& p : mesh.drawing.points) {
+                enclosing_radius = std::max(enclosing_radius, Vector::distance(p, mesh.center));
+            }
+            if (enclosing_radius == 0) {
+                enclosing_radius = 1;
+            }
+            mesh.radius = enclosing_radius * coeff;
+            // translate only along the axis, the radius is absolute
+            mesh.drawing.translate(-mesh.center);
+            double R = mesh.radius;
+
+            // half circle from the bottom to the top of the axis
+            uint32_t arc_segments = std::max<uint32_t>(4, PI * R / boundary_spacing);
+            nloginfo("boundary points: %d", arc_segments + 1);
+            std::vector<Vector> boundary = {Vector(0, -R)};
+            for (uint32_t i = 1; i < arc_segments; i++) {
+                double angle = -PI / 2 + PI * i / arc_segments;
+                boundary.push_back(Vector(R * cos(angle), R * sin(angle)));
+            }
+            boundary.push_back(Vector(0, R));
+            // the axis goes back down through the points of the drawing that lie on it
+            std::vector<double> axis_z;
+            for (auto& p : mesh.drawing.points) {
+                if (p.x == 0) axis_z.push_back(p.y);
+            }
+            std::sort(axis_z.begin(), axis_z.end(), std::greater<double>());
+            axis_z.erase(std::unique(axis_z.begin(), axis_z.end()), axis_z.end());
+            for (double z : axis_z) {
+                boundary.push_back(Vector(0, z));
+            }
+            mesh.drawing.drawPolygon(boundary);
+        }
         // add region near the edge of the circle
-        mesh.drawing.drawRegion(Vector(boundary_circle.radius * 0.9, 0), {0, {0, 0}, magnetostatic_materials::air});
+        mesh.drawing.drawRegion(Vector(mesh.radius * 0.9, 0), {0, {0, 0}, magnetostatic_materials::air});
         // add the boundary 
         // mesh.drawing.plot();
         if (refine_magnets) {
@@ -60,8 +110,10 @@ namespace nikfemm {
 
         mesh.mesh(max_triangle_area, min_angle);
         // mesh.plot();
-        mesh.addKelvinBoundaryConditions();
+        // the tolerance for geometric comparisons comes from the physical mesh only, the far away kelvin
+        // elements can be arbitrarily small or degenerate in the transformed coordinates
         mesh.computeEpsilon();
+        mesh.addKelvinBoundaryConditions(axisymmetric);
         // mesh.plot();
         nloginfo("the mesh has %u nodes and %u elements", mesh.data.numberofpoints, mesh.data.numberoftriangles);
         
@@ -138,16 +190,16 @@ namespace nikfemm {
                 double nu = elem_nu[e];
                 double dnu_dB2 = 0;
                 if (elem_spline[e] >= 0) {
-                    // A^T S A = area * B^2
-                    double B2 = (a[0] * SA[0] + a[1] * SA[1] + a[2] * SA[2]) / system.elem_area[e];
+                    // A^T S A = measure * B^2
+                    double B2 = (a[0] * SA[0] + a[1] * SA[1] + a[2] * SA[2]) / system.elem_measure[e];
                     splines[elem_spline[e]].getNu(B2, nu, dnu_dB2);
                 }
                 for (uint8_t i = 0; i < 3; i++) {
                     r[myelem[i]] -= nu * SA[i];
                 }
                 if (jacobian) {
-                    // d(nu S A)/dA = nu S + 2 dnu/dB^2 (S A) (S A)^T / area
-                    double w = 2 * dnu_dB2 / system.elem_area[e];
+                    // d(nu S A)/dA = nu S + 2 dnu/dB^2 (S A) (S A)^T / measure
+                    double w = 2 * dnu_dB2 / system.elem_measure[e];
                     for (uint8_t k = 0; k < 6; k++) {
                         uint8_t i = MagnetostaticSystem::elem_entry_nodes[k][0];
                         uint8_t j = MagnetostaticSystem::elem_entry_nodes[k][1];
@@ -245,6 +297,15 @@ namespace nikfemm {
         }
         auto tend = std::chrono::high_resolution_clock::now();
         nloginfo("solver took %f ms", std::chrono::duration_cast<std::chrono::microseconds>(tend - tstart).count() / 1000.0);
+
+        // in axisymmetric problems the kelvin exterior region solves for r' A' = r A, where r' is the radius
+        // in the untransformed disk, convert it back to the A_phi of the transformed coordinates
+        if (mesh.axisymmetric && mesh.fem_pointlist.size() == n) {
+            double R_squared = mesh.radius * mesh.radius;
+            for (uint32_t i = mesh.kelvin_first_point; i < n; i++) {
+                A[i] *= mesh.fem_pointlist[i].normSquared() / R_squared;
+            }
+        }
 
         return A;
     }
@@ -409,6 +470,9 @@ namespace nikfemm {
     }
 
     Vector MagnetostaticSimulation::computeForceIntegrals(std::vector<Vector> B, SurroundingRegionBlockIntegralAssets assets, Vector p) {
+        if (mesh.axisymmetric) {
+            nexit("error: forces and torques are not implemented for axisymmetric problems yet");
+        }
         auto start = std::chrono::high_resolution_clock::now();
         
         auto [
@@ -574,6 +638,9 @@ namespace nikfemm {
     }
 
     double MagnetostaticSimulation::computeTorqueIntegral(std::vector<Vector> B, SurroundingRegionBlockIntegralAssets assets, Vector p, Vector center) {
+        if (mesh.axisymmetric) {
+            nexit("error: forces and torques are not implemented for axisymmetric problems yet");
+        }
         auto start = std::chrono::high_resolution_clock::now();
         
         auto [

@@ -105,6 +105,9 @@ namespace nikfemm {
         std::vector<Vector> fem_pointlist;
         // node at the center of the kelvin disk, it represents the point at infinity
         int64_t kelvin_center_point = -1;
+        // the kelvin exterior region is made of the points and triangles from these indices on
+        uint32_t kelvin_first_point = 0;
+        uint32_t kelvin_first_triangle = 0;
 
         MeshData data;
         Drawing<Prop> drawing;
@@ -112,8 +115,8 @@ namespace nikfemm {
         ~Mesh();
 
         void mesh(double max_triangle_area = 1.0, int min_angle = 33, bool split_boundary = true);
-        void addKelvinBoundaryConditions();
-        void kelvinTransformCentered();
+        void addKelvinBoundaryConditions(bool axisymmetric = false);
+        void kelvinTransformCentered(const std::vector<bool>& glued);
         void computeEpsilon();
         std::vector<Vector> computeCurl(std::vector<double>& in) const;
         std::vector<Vector> computeGrad(std::vector<double>& in) const;
@@ -252,8 +255,8 @@ namespace nikfemm {
     }
 
     template <typename Prop>
-    void Mesh<Prop>::kelvinTransformCentered() {
-        // kelvin transform each Vertex<Prop> in the mesh
+    void Mesh<Prop>::kelvinTransformCentered(const std::vector<bool>& glued) {
+        // kelvin transform each Vertex<Prop> in the mesh except the ones glued to the interior mesh
         /*
 
         x* = (R^2 / |x|^2) * x
@@ -265,7 +268,7 @@ namespace nikfemm {
         // printf("R^2 = %f\n", R_squared);
 
         for (uint32_t i = 0; i < data.numberofpoints; i++) {
-            if (data.pointmarkerlist[i] == 0) {  // if it's not a boundary point
+            if (!glued[i]) {
                 Vector v = data.pointlist[i];
                 double mag_squared = v.x * v.x + v.y * v.y;
                 double scale = R_squared / mag_squared;
@@ -276,7 +279,6 @@ namespace nikfemm {
                     data.pointlist[i] = Vector(radius * max_radius_coeff, 0);
                 } else if (dist < max_x) {
                 // if (false) {
-                    nloginfo("kelvin transform too large");
                     data.pointlist[i] = v * ((radius * max_radius_coeff) / dist);
                 } else {
                     data.pointlist[i] = v * scale;
@@ -286,30 +288,41 @@ namespace nikfemm {
     }
 
     template <typename Prop>
-    void Mesh<Prop>::addKelvinBoundaryConditions() {
+    void Mesh<Prop>::addKelvinBoundaryConditions(bool axisymmetric) {
         // kelvin mesh = km
         // this mesh = tm
-        // kelvin mesh boundary vertices = kmb
-        // this mesh boundary vertices = tmb
-        // kelvin mesh vertices = kmv
-        // this mesh vertices = tmv
 
         Mesh<Prop> kelvin_mesh;
 
-        // the boundary of the kelvin disk is made of the boundary vertices of this mesh, including the ones
-        // that triangle inserted on the boundary segments, so that the two meshes share all the boundary vertices
-        std::vector<Vector> boundary_vertices;
+        // the kelvin disk is glued to this mesh along the boundary circle, so its boundary is made of the boundary
+        // vertices of this mesh, including the ones that triangle inserted on the boundary segments
+        // in axisymmetric problems the boundary is a half circle closed by the symmetry axis, the vertices on
+        // the axis are not glued because the axis of the kelvin disk is the far away part of the axis
+        std::vector<uint32_t> glued_vertices;
         for (uint32_t i = 0; i < data.numberofpoints; i++) {
-            if (data.pointmarkerlist[i]) {
-                boundary_vertices.push_back(data.pointlist[i]);
+            if (data.pointmarkerlist[i] && !(axisymmetric && data.pointlist[i].x == 0 && fabs(data.pointlist[i].y) < radius)) {
+                glued_vertices.push_back(i);
             }
         }
-        std::sort(boundary_vertices.begin(), boundary_vertices.end(), [](const Vector& a, const Vector& b) {
-            return atan2(a.y, a.x) < atan2(b.y, b.x);
+        std::sort(glued_vertices.begin(), glued_vertices.end(), [this](uint32_t a, uint32_t b) {
+            return atan2(data.pointlist[a].y, data.pointlist[a].x) < atan2(data.pointlist[b].y, data.pointlist[b].x);
         });
-        kelvin_mesh.drawing.drawPolygon(boundary_vertices);
-        // the center of the disk is the image of the point at infinity
-        kelvin_mesh.drawing.drawPoint(Vector(0, 0));
+        std::vector<Vector> kelvin_boundary;
+        for (auto i : glued_vertices) {
+            kelvin_boundary.push_back(data.pointlist[i]);
+        }
+        if (!axisymmetric) {
+            // the center of the disk is the image of the point at infinity
+            kelvin_mesh.drawing.drawPoint(Vector(0, 0));
+        } else {
+            // the axis of the kelvin half disk, from the top to the bottom, spaced like the boundary vertices
+            double spacing = PI * radius / (glued_vertices.size() - 1);
+            uint32_t axis_segments = std::max<uint32_t>(2, ceil(2 * radius / spacing));
+            for (uint32_t i = 1; i < axis_segments; i++) {
+                kelvin_boundary.push_back(Vector(0, radius - 2 * radius * i / axis_segments));
+            }
+        }
+        kelvin_mesh.drawing.drawPolygon(kelvin_boundary);
         kelvin_mesh.drawing.drawRegion(Vector(radius * 0.5, 0), default_prop);
 
         // no area constraint, the elements grade from the boundary spacing so the mesh doesn't depend on the units
@@ -323,55 +336,31 @@ namespace nikfemm {
         // the transformed coordinates are only used for post processing
         std::vector<Vector> kelvin_disk_points(kelvin_mesh.data.pointlist, kelvin_mesh.data.pointlist + kelvin_mesh.data.numberofpoints);
 
-        // merge km into tm
-        // transform km
-        kelvin_mesh.kelvinTransformCentered();
-        // kelvin_mesh.plot();
-
-        // merge km into tm
-        // for each vertex in km, find the corresponding vertex in tm and build a map from kmb to tmb
-
-        // 1. create map from kelvin mesh boundary vertices to this mesh boundary vertices
-        // 2. calculate new this mesh point number
-        // 3. reallocate memory for this mesh
-        // 4. add kelvin mesh non boundary vertices to this mesh
-        // 5. create map from old kelvin mesh vertices minus boundary to new mesh vertices
-        // 6. calculate new this mesh triangle number
-        // 7. reallocate memory for this mesh
-        // 8. use map to update triangle vertex indices
-        // 9. add kelvin mesh triangles to this mesh
-
+        // map the glued vertices of the kelvin mesh to the vertices of this mesh, they have the same coordinates
+        std::map<std::pair<double, double>, uint32_t> glued_ids;
+        for (auto i : glued_vertices) {
+            glued_ids[{data.pointlist[i].x, data.pointlist[i].y}] = i;
+        }
         std::map<uint32_t, uint32_t> kelvin_to_this;
-        uint32_t kelvin_number_of_boundary_points = 0;
+        std::vector<bool> kelvin_glued(kelvin_mesh.data.numberofpoints, false);
         for (uint32_t i = 0; i < kelvin_mesh.data.numberofpoints; i++) {
-            if (kelvin_mesh.data.pointmarkerlist[i]) {
-                for (uint32_t j = 0; j < data.numberofpoints; j++) {
-                    if (data.pointmarkerlist[j]) {
-                        if (data.pointlist[j].x == kelvin_mesh.data.pointlist[i].x && data.pointlist[j].y == kelvin_mesh.data.pointlist[i].y) {
-                            kelvin_to_this[i] = j;
-                            kelvin_number_of_boundary_points++;
-                            break;
-                        }
-                    }
-                }
+            auto it = glued_ids.find({kelvin_disk_points[i].x, kelvin_disk_points[i].y});
+            if (it != glued_ids.end()) {
+                kelvin_to_this[i] = it->second;
+                kelvin_glued[i] = true;
             }
         }
 
-        // every boundary vertex must be shared by the two meshes, otherwise the exterior is not glued to the interior
-        uint32_t kelvin_boundary_points = 0;
-        uint32_t this_boundary_points = 0;
-        for (uint32_t i = 0; i < kelvin_mesh.data.numberofpoints; i++) {
-            if (kelvin_mesh.data.pointmarkerlist[i]) kelvin_boundary_points++;
-        }
-        for (uint32_t j = 0; j < data.numberofpoints; j++) {
-            if (data.pointmarkerlist[j]) this_boundary_points++;
-        }
-        if (kelvin_number_of_boundary_points != kelvin_boundary_points || kelvin_number_of_boundary_points != this_boundary_points) {
+        // every glued vertex must be shared by the two meshes, otherwise the exterior is not glued to the interior
+        if (kelvin_to_this.size() != glued_vertices.size()) {
             nexit("error: the kelvin mesh boundary does not match the mesh boundary");
         }
 
+        // transform km
+        kelvin_mesh.kelvinTransformCentered(kelvin_glued);
+
         // calculate new this mesh point number
-        uint32_t new_point_number = data.numberofpoints + kelvin_mesh.data.numberofpoints - kelvin_number_of_boundary_points;
+        uint32_t new_point_number = data.numberofpoints + kelvin_mesh.data.numberofpoints - glued_vertices.size();
 
         // reallocate memory for this mesh
         data.pointlist = (Vector *) realloc(data.pointlist, new_point_number * sizeof(Vector));
@@ -379,21 +368,22 @@ namespace nikfemm {
         // data.pointattributelist = (TRI_REAL *) realloc(data.pointattributelist, new_point_number * sizeof(TRI_REAL));
         // data.pointmarkerlist = (int *) realloc(data.pointmarkerlist, new_point_number * sizeof(int));
         fem_pointlist = std::vector<Vector>(data.pointlist, data.pointlist + data.numberofpoints);
+        kelvin_first_point = data.numberofpoints;
+        kelvin_first_triangle = data.numberoftriangles;
 
-        // add kelvin mesh non boundary vertices to this mesh
+        // add kelvin mesh non glued vertices to this mesh
         for (uint32_t i = 0; i < kelvin_mesh.data.numberofpoints; i++) {
-            if (!kelvin_mesh.data.pointmarkerlist[i]) {
+            if (!kelvin_glued[i]) {
                 data.pointlist[data.numberofpoints] = kelvin_mesh.data.pointlist[i];
                 fem_pointlist.push_back(kelvin_disk_points[i]);
                 if (kelvin_disk_points[i].x == 0 && kelvin_disk_points[i].y == 0) {
                     kelvin_center_point = data.numberofpoints;
                 }
-                // data.pointmarkerlist[data.numberofpoints] = 0;
                 kelvin_to_this[i] = data.numberofpoints;
                 data.numberofpoints++;
             }
         }
-        if (kelvin_center_point < 0) {
+        if (kelvin_center_point < 0 && !axisymmetric) {
             nexit("error: the kelvin mesh has no vertex at its center");
         }
 
@@ -409,17 +399,12 @@ namespace nikfemm {
 
         // use map to update triangle vertex indices
         for (uint32_t i = 0; i < kelvin_mesh.data.numberoftriangles; i++) {
-            // check if point in map else leave it alone
             for (uint8_t j = 0; j < 3; j++) {
-                if (kelvin_to_this.count(kelvin_mesh.data.trianglelist[i][j])) {
-                    data.trianglelist[data.numberoftriangles][j] = kelvin_to_this[kelvin_mesh.data.trianglelist[i][j]];
-                }
+                data.trianglelist[data.numberoftriangles][j] = kelvin_to_this.at(kelvin_mesh.data.trianglelist[i][j]);
             }
             data.triangleattributelist[data.numberoftriangles] = default_prop_id;
             data.numberoftriangles++;
         }
-
-        data.numberoftriangles = new_triangle_number;
     }
 
     template <typename Prop>

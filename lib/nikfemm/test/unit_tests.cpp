@@ -524,6 +524,71 @@ BOOST_AUTO_TEST_CASE( magnetostatic_bh_spline )
     }
 }
 
+// area weighted mean of B over the elements whose barycenter has r < rmax and |z - z0| < dz
+static Vector axisAverageB(MagnetostaticSimulation& sim, std::vector<Vector>& B, double rmax, double z0, double dz) {
+    auto& d = sim.mesh.data;
+    Vector acc = {0, 0};
+    double w = 0;
+    for (int i = 0; i < d.numberoftriangles; i++) {
+        Vector c = d.getElemBarycenter(i) + sim.mesh.center;
+        if (c.x > rmax || fabs(c.y - z0) > dz) continue;
+        acc += B[i] * d.getArea(i);
+        w += d.getArea(i);
+    }
+    return acc / w;
+}
+
+BOOST_AUTO_TEST_CASE( magnetostatic_axisymmetric_coil )
+{
+    // thick coil with azimuthal current density J, the field on the axis has a closed form
+    double a1 = 0.01, a2 = 0.02, h = 0.02, J = 5e6;
+    MagnetostaticSimulation sim;
+    sim.axisymmetric = true;
+    sim.mesh.drawing.drawRectangle(Vector(a1, -h / 2), Vector(a2, h / 2));
+    sim.mesh.drawing.drawRegion(Vector((a1 + a2) / 2, 0), {J, {0, 0}, MU0});
+    auto system = sim.generateSystem(false, 5e-8);
+    auto A = sim.solve(system);
+    auto B = sim.mesh.computeCurl(A);
+    auto F = [&](double d) { return d * log((a2 + sqrt(a2 * a2 + d * d)) / (a1 + sqrt(a1 * a1 + d * d))); };
+    // the last point is close to the boundary circle, inside the domain the kelvin exterior must make it open
+    for (double z : {0.0, 0.02, 0.03}) {
+        Vector b = axisAverageB(sim, B, 0.0005, z, 0.0005);
+        BOOST_CHECK_CLOSE(b.y, MU0 * J / 2 * (F(z + h / 2) - F(z - h / 2)), 0.5);
+    }
+}
+
+BOOST_AUTO_TEST_CASE( magnetostatic_axisymmetric_magnetized_sphere )
+{
+    // uniformly magnetized sphere with mu_r = 1: B inside = 2/3 mu0 M, drawn as a half disk on the axis
+    double a = 0.01, M = 1e6;
+    std::vector<Vector> half_disk = {Vector(0, -a)};
+    for (int i = 1; i < 90; i++) {
+        double t = -PI / 2 + PI * i / 90;
+        half_disk.push_back(Vector(a * cos(t), a * sin(t)));
+    }
+    half_disk.push_back(Vector(0, a));
+    MagnetostaticSimulation sim;
+    sim.axisymmetric = true;
+    sim.mesh.drawing.drawPolygon(half_disk);
+    sim.mesh.drawing.drawRegion(Vector(a / 2, 0), {0, {0, M}, MU0});
+    auto system = sim.generateSystem(false, 5e-8);
+    auto A = sim.solve(system);
+    auto B = sim.mesh.computeCurl(A);
+
+    auto& d = sim.mesh.data;
+    Vector acc = {0, 0};
+    double w = 0;
+    for (int i = 0; i < d.numberoftriangles; i++) {
+        Vector c = d.getElemBarycenter(i) + sim.mesh.center;
+        if (c.norm() > 0.7 * a) continue;
+        // volume weight of the element
+        acc += B[i] * d.getArea(i) * c.x;
+        w += d.getArea(i) * c.x;
+    }
+    BOOST_CHECK_CLOSE(acc.y / w, 2. / 3. * MU0 * M, 0.5);
+    BOOST_CHECK_SMALL(acc.x / w, 1e-3);
+}
+
 BOOST_AUTO_TEST_CASE( magnetostatic_off_center_wire )
 {
     // a single wire carrying a net current, away from the center of the boundary: the return current is at infinity

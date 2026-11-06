@@ -22,11 +22,15 @@
 
 namespace nikfemm {
     struct MagnetostaticMesh : Mesh<MagnetostaticProp> {
+        bool axisymmetric = false;
+
         MagnetostaticMesh();
 
         MagnetostaticSystem getFemSystem();
         void addDirichletInfiniteBoundaryConditions(MagnetostaticSystem& system);
         void refineMeshAroundMagnets();
+        // B = curl(A), in axisymmetric problems (B_r, B_z) from the azimuthal vector potential
+        std::vector<Vector> computeCurl(std::vector<double>& in) const;
     };
 }
 

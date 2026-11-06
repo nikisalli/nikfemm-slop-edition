@@ -13,35 +13,82 @@ namespace nikfemm {
         system.b = std::vector<double>(n, 0);
         system.elem_stiffness.resize(m);
         system.elem_entries.resize(m);
-        system.elem_area.resize(m);
+        system.elem_measure.resize(m);
 
         auto start = std::chrono::high_resolution_clock::now();
 
         // the kelvin exterior region is assembled in its untransformed coordinates
-        const Vector* points = fem_pointlist.size() == (size_t)data.numberofpoints ? fem_pointlist.data() : data.pointlist;
+        bool has_kelvin = fem_pointlist.size() == (size_t)data.numberofpoints;
+        const Vector* points = has_kelvin ? fem_pointlist.data() : data.pointlist;
+
+        // 7 point gauss rule (exact up to degree 5) for the radius weighted integrals of axisymmetric problems
+        // barycentric coordinates and weight of each point
+        static const double gauss_points[7][4] = {
+            {1. / 3., 1. / 3., 1. / 3., 0.225},
+            {0.059715871789770, 0.470142064105115, 0.470142064105115, 0.132394152788506},
+            {0.470142064105115, 0.059715871789770, 0.470142064105115, 0.132394152788506},
+            {0.470142064105115, 0.470142064105115, 0.059715871789770, 0.132394152788506},
+            {0.797426985353087, 0.101286507323456, 0.101286507323456, 0.125939180544827},
+            {0.101286507323456, 0.797426985353087, 0.101286507323456, 0.125939180544827},
+            {0.101286507323456, 0.101286507323456, 0.797426985353087, 0.125939180544827}
+        };
 
         // surface integral, element by element
         for (uint32_t e = 0; e < m; e++) {
             Elem myelem = data.trianglelist[e];
-            Vector p0 = points[myelem[0]];
-            Vector p1 = points[myelem[1]];
-            Vector p2 = points[myelem[2]];
-            double area = fabs((p1 - p0) ^ (p2 - p0)) / 2;
+            Vector p[3] = {points[myelem[0]], points[myelem[1]], points[myelem[2]]};
+            double double_area = (p[1] - p[0]) ^ (p[2] - p[0]);
+            double area = fabs(double_area) / 2;
 
-            // gradients of the shape functions times twice the area, the sign doesn't matter in the products
-            double b[3] = {p1.y - p2.y, p2.y - p0.y, p0.y - p1.y};
-            double c[3] = {p2.x - p1.x, p0.x - p2.x, p1.x - p0.x};
-            for (uint8_t k = 0; k < 6; k++) {
-                uint8_t i = MagnetostaticSystem::elem_entry_nodes[k][0];
-                uint8_t j = MagnetostaticSystem::elem_entry_nodes[k][1];
-                system.elem_stiffness[e][k] = (b[i] * b[j] + c[i] * c[j]) / (4 * area);
-            }
-            system.elem_area[e] = area;
-
-            // set the b vector
+            // gradients of the shape functions times twice the signed area
+            double b[3] = {p[1].y - p[2].y, p[2].y - p[0].y, p[0].y - p[1].y};
+            double c[3] = {p[2].x - p[1].x, p[0].x - p[2].x, p[1].x - p[0].x};
             double J = drawing.getRegionPtrFromId(data.triangleattributelist[e])->J;
-            for (uint8_t i = 0; i < 3; i++) {
-                system.b[myelem[i]] += J * area / 3;
+
+            if (!axisymmetric) {
+                // the sign of the area doesn't matter in the products
+                for (uint8_t k = 0; k < 6; k++) {
+                    uint8_t i = MagnetostaticSystem::elem_entry_nodes[k][0];
+                    uint8_t j = MagnetostaticSystem::elem_entry_nodes[k][1];
+                    system.elem_stiffness[e][k] = (b[i] * b[j] + c[i] * c[j]) / (4 * area);
+                }
+                system.elem_measure[e] = area;
+
+                // set the b vector
+                for (uint8_t i = 0; i < 3; i++) {
+                    system.b[myelem[i]] += J * area / 3;
+                }
+            } else {
+                // the unknown is A_phi with linear shape functions, x is the radius and y the axial coordinate
+                // B_r = -dA/dz and B_z = dA/dr + A/r, the energy is the integral of nu B^2 r / 2 (per radian)
+                double dNdr[3], dNdz[3];
+                for (uint8_t i = 0; i < 3; i++) {
+                    dNdr[i] = b[i] / double_area;
+                    dNdz[i] = c[i] / double_area;
+                }
+                // the kelvin transformation of an axisymmetric exterior region needs a reluctivity
+                // proportional to the square of the distance from the center of the disk
+                bool kelvin = has_kelvin && e >= kelvin_first_triangle;
+                system.elem_stiffness[e].fill(0);
+                for (auto& g : gauss_points) {
+                    double r = g[0] * p[0].x + g[1] * p[1].x + g[2] * p[2].x;
+                    double z = g[0] * p[0].y + g[1] * p[1].y + g[2] * p[2].y;
+                    double w = g[3] * area * (kelvin ? (r * r + z * z) / (radius * radius) : 1);
+                    for (uint8_t k = 0; k < 6; k++) {
+                        uint8_t i = MagnetostaticSystem::elem_entry_nodes[k][0];
+                        uint8_t j = MagnetostaticSystem::elem_entry_nodes[k][1];
+                        // (dN_i/dr + N_i/r)(dN_j/dr + N_j/r) r + dN_i/dz dN_j/dz r
+                        system.elem_stiffness[e][k] += w * (r * (dNdr[i] * dNdr[j] + dNdz[i] * dNdz[j]) +
+                                                            g[i] * dNdr[j] + g[j] * dNdr[i] + g[i] * g[j] / r);
+                    }
+                }
+                // integral of r over the element
+                system.elem_measure[e] = area * (p[0].x + p[1].x + p[2].x) / 3;
+
+                // the integral of N_i r over the element
+                for (uint8_t i = 0; i < 3; i++) {
+                    system.b[myelem[i]] += J * area * (p[i].x + p[0].x + p[1].x + p[2].x) / 12;
+                }
             }
         }
 
@@ -191,8 +238,15 @@ namespace nikfemm {
                         // this edge is subject to a surface current
                         // the integral of a linear shape function over the edge is length / 2
                         double length = Vector::distance(p1, p2);
-                        system.b[v1] += length * segment.Jm * 0.5;
-                        system.b[v2] += length * segment.Jm * 0.5;
+                        if (!axisymmetric) {
+                            system.b[v1] += length * segment.Jm * 0.5;
+                            system.b[v2] += length * segment.Jm * 0.5;
+                        } else {
+                            // the out of plane direction of the drawing is -phi, and the line integral is weighted by r
+                            double K = -segment.Jm;
+                            system.b[v1] += K * length * (2 * p1.x + p2.x) / 6;
+                            system.b[v2] += K * length * (p1.x + 2 * p2.x) / 6;
+                        }
                     }
                 }
             }
@@ -206,6 +260,17 @@ namespace nikfemm {
     }
 
     void MagnetostaticMesh::addDirichletInfiniteBoundaryConditions(MagnetostaticSystem& system) {
+        // in axisymmetric problems A_phi is zero on the symmetry axis, which also contains the point at infinity
+        if (axisymmetric) {
+            const Vector* points = fem_pointlist.size() == (size_t)data.numberofpoints ? fem_pointlist.data() : data.pointlist;
+            for (uint32_t i = 0; i < (uint32_t)data.numberofpoints; i++) {
+                if (fabs(points[i].x) <= 1e-12 * radius) {
+                    system.addDirichletBoundaryCondition(i, 0);
+                }
+            }
+            return;
+        }
+
         // with the kelvin exterior region the potential is zero at infinity, i.e. at the center of the kelvin disk
         if (kelvin_center_point >= 0) {
             system.addDirichletBoundaryCondition(kelvin_center_point, 0);
@@ -243,6 +308,21 @@ namespace nikfemm {
         system.addDirichletBoundaryCondition(p1, 0);
         system.addDirichletBoundaryCondition(p2, 0);
         system.addDirichletBoundaryCondition(p3, 0);
+    }
+
+    std::vector<Vector> MagnetostaticMesh::computeCurl(std::vector<double>& in) const {
+        if (!axisymmetric) {
+            return Mesh<MagnetostaticProp>::computeCurl(in);
+        }
+        // B_r = -dA/dz and B_z = dA/dr + A/r at the barycenter of each element
+        std::vector<Vector> out = computeGrad(in);
+        for (uint32_t i = 0; i < (uint32_t)data.numberoftriangles; i++) {
+            Elem myelem = data.trianglelist[i];
+            double r = (data.pointlist[myelem[0]].x + data.pointlist[myelem[1]].x + data.pointlist[myelem[2]].x) / 3;
+            double A = (in[myelem[0]] + in[myelem[1]] + in[myelem[2]]) / 3;
+            out[i] = Vector(-out[i].y, out[i].x + A / r);
+        }
+        return out;
     }
 
     void MagnetostaticMesh::refineMeshAroundMagnets() {

@@ -21,10 +21,11 @@ namespace nikfemm {
         std::vector<int> row_ind;
 
         // per element: the 6 entries of the stiffness matrix with unit reluctivity, the position of
-        // each entry in row_ind and the element area
+        // each entry in row_ind and the element measure (the area, or the integral of r in axisymmetric problems)
+        // so that the mean B^2 of the element is A^T S A / measure
         std::vector<std::array<double, 6>> elem_stiffness;
         std::vector<std::array<int, 6>> elem_entries;
-        std::vector<double> elem_area;
+        std::vector<double> elem_measure;
 
         std::vector<double> b;  // source vector (current densities and magnets)
 
