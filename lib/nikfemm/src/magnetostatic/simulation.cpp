@@ -20,21 +20,18 @@
 #include "../algebra/math.hpp"
 
 namespace nikfemm {
-    void MagnetostaticSimulation::updateMu(std::vector<Vector> B, std::vector<const MagnetostaticProp*>& props, std::vector<double>& mu, double residual, uint32_t iter) {
+    void MagnetostaticSimulation::updateMu(const std::vector<Vector>& B, std::vector<const MagnetostaticProp*>& props, std::vector<double>& mu, double relaxation) {
         assert(mu.size() == B.size());
-        double kalman_scemo = exp(-((double)iter) / 5.);
-        // printf("kalman_scemo: %.17g\n", kalman_scemo);
-        // printf("exp(-(iter + 1) / 100): %.17g\n", exp(-((double)iter + 1.) / 100.));
-        // printf("- (iter + 1) / 100: %.17g\n", - ((double)iter + 1.) / 100.);
-        
+
         for (uint32_t i = 0; i < B.size(); i++) {
             double Bmag = B[i].norm();
             if (props[i]->isLinear()) {
                 mu[i] = props[i]->getMu(Bmag);
             } else {
-                mu[i] = (props[i]->getMu(Bmag) * (1 - kalman_scemo)) + ((mu[i] + magnetostatic_materials::vacuum * residual * residual) * kalman_scemo); 
-                // mu[i] += (props[i]->getMu(Bmag) - mu[i]) * 0.1;  // mu += (mu_new - mu) * 0.1
-                // mu[i] += props[i]->getMu(Bmag);  // pure newton-raphson
+                // relax the reluctivity because the stiffness matrix is linear in it
+                double nu_old = 1 / mu[i];
+                double nu_new = 1 / props[i]->getMu(Bmag);
+                mu[i] = 1 / (nu_old + (nu_new - nu_old) * relaxation);
             }
         }
     }
@@ -75,7 +72,7 @@ namespace nikfemm {
 
         mesh.mesh(max_triangle_area, min_angle);
         // mesh.plot();
-        mesh.addKelvinBoundaryConditions(boundary_points);
+        mesh.addKelvinBoundaryConditions();
         mesh.computeEpsilon();
         // mesh.plot();
         nloginfo("the mesh has %u nodes and %u elements", mesh.data.numberofpoints, mesh.data.numberoftriangles);
@@ -118,45 +115,62 @@ namespace nikfemm {
             }
         }
 
+        // the tolerances are relative to the norm of the source vector so that they don't depend on the units
+        double b_norm = norm(b);
+        if (b_norm == 0) {
+            nloginfo("no sources, the solution is zero");
+            return A;
+        }
+
         auto tstart = std::chrono::high_resolution_clock::now();
         if (all_linear) {
             nloginfo("all magnetostatic_materials are linear");
-            preconditionedSSORConjugateGradientSolver(FemMat, b, A, 1.5, 1e-6, 100000);
+            preconditionedSSORConjugateGradientSolver(FemMat, b, A, 1.5, 1e-10 * b_norm, 100000);
             // preconditionedIncompleteCholeskyConjugateGradientSolver(FemMat, b, A, 1e-6, 100000);
         } else {
-            nloginfo("nonlinear magnetostatic_materials detected, starting non linear newton solver");
+            nloginfo("nonlinear magnetostatic_materials detected, starting non linear fixed point solver");
             std::vector<double> r(system.b.size());  // residual
 
-            double residual = 1e10;
+            double residual = std::numeric_limits<double>::infinity();
+            double last_residual = std::numeric_limits<double>::infinity();
+            double relaxation = 1;
+            bool converged = false;
             for (uint32_t i = 0; i < 500; i++) {
-                // conjugateGradientSolver(FemMat, b, A, 1e-7, 10000);
-                // preconditionedJacobiConjugateGradientSolver(FemMat, b, A, 1e-7, 1000);
-                preconditionedSSORConjugateGradientSolver(FemMat, b, A, 1.5, 1e-7, 50);
-                // preconditionedIncompleteCholeskyConjugateGradientSolver(FemMat, b, A, 1e-7, 1000);
-                // mesh.Aplot(A);
-                // mesh.Bplot(B);
+                // the linear solve is allowed to be inexact, the outer iterations take care of the remaining error
+                preconditionedSSORConjugateGradientSolver(FemMat, b, A, 1.5, 1e-10 * b_norm, 50);
 
                 B = mesh.computeCurl(A);
-                // mesh.Bplot(B);
 
-                // check if the solution is correct
-                MagnetostaticSimulation::updateMu(B, props, mu, residual, i);
+                MagnetostaticSimulation::updateMu(B, props, mu, relaxation);
                 FemMat.evaluate(mu);
                 for (uint32_t i = 0; i < system.b.size(); i++) {
                     b[i] = system.b[i].evaluate(mu);
                 }
+
+                // relative residual of the system assembled with the updated permeabilities
                 mult(r, FemMat, A);
                 sub(r, b, r);
-                residual = norm(r);
-                if (residual < 1e-7) {
+                residual = norm(r) / b_norm;
+                nloginfo("nonlinear iteration %d, relative residual: %.17g, relaxation: %.3f", i, residual, relaxation);
+                if (residual < 1e-8) {
                     nloginfo("Converged in %d iterations", i);
+                    converged = true;
                     break;
                 }
-                // nloginfo("%.17g, %.17g; ", K, residual);
-                nloginfo("nonlinear iteration %d, residual: %.17g", i, residual);
-                // print mu
-                // nloginfo("%f,", residual);
+
+                // adaptive relaxation, same scheme as femm
+                if (i > 5) {
+                    if (residual > last_residual && relaxation > 0.1) {
+                        relaxation /= 2;
+                    } else {
+                        relaxation += 0.1 * (1 - relaxation);
+                    }
+                }
+                last_residual = residual;
                 fflush(stdout);
+            }
+            if (!converged) {
+                nlogwarn("nonlinear solver did not converge, last relative residual: %.17g", residual);
             }
         }
         auto tend = std::chrono::high_resolution_clock::now();

@@ -87,16 +87,22 @@ namespace nikfemm {
     }
 
     Circle Circle::getEnclosingCircle(std::vector<Vector> points) {
-        double maxmod = 0;
         Vector center = {0, 0};
+        if (points.size() == 0) {
+            return Circle(center, 0);
+        }
         for (auto p : points) {
-            double mod = p.norm();
-            if (mod > maxmod) {
-                maxmod = mod;
-            }
             center += p;
         }
         center /= points.size();
+        // the radius is measured from the center, not from the origin
+        double maxmod = 0;
+        for (auto p : points) {
+            double mod = Vector::distance(p, center);
+            if (mod > maxmod) {
+                maxmod = mod;
+            }
+        }
         return Circle(center, maxmod);
     }
 }
