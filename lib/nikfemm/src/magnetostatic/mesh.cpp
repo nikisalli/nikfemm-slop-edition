@@ -24,6 +24,9 @@ namespace nikfemm {
             }
         }
 
+        // the kelvin exterior region is assembled in its untransformed coordinates
+        const Vector* points = fem_pointlist.size() == (size_t)data.numberofpoints ? fem_pointlist.data() : data.pointlist;
+
         // surface integral
         for (uint32_t i = 0; i < data.numberofpoints; i++) {
             for (uint8_t j = 0; j < adjelems_count[i]; j++) {
@@ -43,21 +46,21 @@ namespace nikfemm {
                     nexit("error: vertex not found in element");
                 }
 
-                double double_oriented_area = data.getDoubleOrientedArea(v1, v2, v3);
-                
+                double double_oriented_area = (points[v2] - points[v1]) ^ (points[v3] - points[v1]);
+
                 if (double_oriented_area < 0) {
                     std::swap(v2, v3);
                 }
 
-                double double_area = data.getDoubleOrientedArea(v1, v2, v3);
+                double double_area = (points[v2] - points[v1]) ^ (points[v3] - points[v1]);
 
                 // elements are only added if they are in the upper triangle because the matrix is symmetric and this saves half the memory
-                double b1 = (data.pointlist[v2].y - data.pointlist[v3].y) / double_area;
-                double c1 = (data.pointlist[v3].x - data.pointlist[v2].x) / double_area;
-                double b2 = (data.pointlist[v3].y - data.pointlist[v1].y) / double_area;
-                double c2 = (data.pointlist[v1].x - data.pointlist[v3].x) / double_area;
-                double b3 = (data.pointlist[v1].y - data.pointlist[v2].y) / double_area;
-                double c3 = (data.pointlist[v2].x - data.pointlist[v1].x) / double_area;
+                double b1 = (points[v2].y - points[v3].y) / double_area;
+                double c1 = (points[v3].x - points[v2].x) / double_area;
+                double b2 = (points[v3].y - points[v1].y) / double_area;
+                double c2 = (points[v1].x - points[v3].x) / double_area;
+                double b3 = (points[v1].y - points[v2].y) / double_area;
+                double c3 = (points[v2].x - points[v1].x) / double_area;
                 if (v1 >= i) system.A(i, v1) += NonLinearTerm({double_area * (b1 * b1 + c1 * c1) * 0.5, adjelems_ids[i][j]});
                 if (v2 >= i) system.A(i, v2) += NonLinearTerm({double_area * (b2 * b1 + c2 * c1) * 0.5, adjelems_ids[i][j]});
                 if (v3 >= i) system.A(i, v3) += NonLinearTerm({double_area * (b3 * b1 + c3 * c1) * 0.5, adjelems_ids[i][j]});
@@ -98,9 +101,7 @@ namespace nikfemm {
         for (auto region_poly_array : polygons_that_contain_magnet_region) {
             if (region_poly_array.second.size() == 1) {
                 // this is a magnet
-                for (auto point : region_poly_array.second[0].points) {
-                    magnets.push_back({region_poly_array.second[0], drawing.region_map[region_poly_array.first].M, {}});
-                }
+                magnets.push_back({region_poly_array.second[0], drawing.region_map[region_poly_array.first].M, {}});
             } else {
                 // this array contains a magnet and other polygons that contain the polygon that is a magnet
                 // we need to find the polygon that does not contain any other polygon that contains the same region
@@ -183,9 +184,10 @@ namespace nikfemm {
                     double dist2 = Segment::pointSegmentDistance(p2, segment.p1, segment.p2);
                     if (dist1 < epsilon * 0.1 && dist2 < epsilon * 0.1) {
                         // this edge is subject to a surface current
+                        // the integral of a linear shape function over the edge is length / 2
                         double length = Vector::distance(p1, p2);
-                        system.b[edge.v1] += length * segment.Jm;
-                        system.b[edge.v2] += length * segment.Jm;
+                        system.b[edge.v1] += length * segment.Jm * 0.5;
+                        system.b[edge.v2] += length * segment.Jm * 0.5;
                     }
                 }
             }
@@ -199,6 +201,12 @@ namespace nikfemm {
     }
 
     void MagnetostaticMesh::addDirichletInfiniteBoundaryConditions(System<NonLinearExpression>& system) {
+        // with the kelvin exterior region the potential is zero at infinity, i.e. at the center of the kelvin disk
+        if (kelvin_center_point >= 0) {
+            system.addDirichletBoundaryCondition(kelvin_center_point, 0);
+            return;
+        }
+
         // find three furthest points from the center
         uint32_t p1 = 0;
         uint32_t p2 = 0;
@@ -251,9 +259,7 @@ namespace nikfemm {
         for (auto region_poly_array : polygons_that_contain_magnet_region) {
             if (region_poly_array.second.size() == 1) {
                 // this is a magnet
-                for (auto point : region_poly_array.second[0].points) {
-                    magnets.push_back(region_poly_array.second[0]);
-                }
+                magnets.push_back(region_poly_array.second[0]);
             } else {
                 // this array contains a magnet and other polygons that contain the polygon that is a magnet
                 // we need to find the polygon that does not contain any other polygon that contains the same region

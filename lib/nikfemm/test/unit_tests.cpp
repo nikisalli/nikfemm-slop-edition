@@ -389,3 +389,108 @@ BOOST_AUTO_TEST_CASE( current_density_dirichlet_boundary_conditions )
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+// analytic magnetostatic benchmarks, SI units
+namespace {
+    const double MU0 = 4 * PI * 1e-7;
+
+    // area weighted average of the azimuthal component of B over the elements whose barycenter is at distance [r - dr, r + dr] from c
+    double ringAverageBtheta(MagnetostaticSimulation& sim, std::vector<Vector>& B, Vector c, double r, double dr) {
+        auto& d = sim.mesh.data;
+        double w = 0, bt = 0;
+        for (int i = 0; i < d.numberoftriangles; i++) {
+            Vector p = d.getElemBarycenter(i) + sim.mesh.center - c;
+            if (fabs(p.norm() - r) > dr) continue;
+            double th = atan2(p.y, p.x);
+            bt += d.getArea(i) * (-B[i].x * sin(th) + B[i].y * cos(th));
+            w += d.getArea(i);
+        }
+        return bt / w;
+    }
+
+    // coaxial cable: inner conductor +I, gap material, outer return conductor -I
+    // by symmetry H = I / (2 pi r) in the gap whatever the material is
+    std::vector<Vector> solveCoax(MagnetostaticSimulation& sim, MagnetostaticProp gap, double I) {
+        double a = 0.01, b = 0.03, c = 0.035;
+        sim.mesh.drawing.drawCircle(Vector(0, 0), a, 120);
+        sim.mesh.drawing.drawCircle(Vector(0, 0), b, 120);
+        sim.mesh.drawing.drawCircle(Vector(0, 0), c, 120);
+        sim.mesh.drawing.drawRegion(Vector(0, 0), {I / (PI * a * a), {0, 0}, MU0});
+        sim.mesh.drawing.drawRegion(Vector(0.02, 0.0005), gap);
+        sim.mesh.drawing.drawRegion(Vector(0.0325, 0.0005), {-I / (PI * (c * c - b * b)), {0, 0}, MU0});
+        auto system = sim.generateSystem(false, 1e-6);
+        auto A = sim.solve(system);
+        return sim.mesh.computeCurl(A);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE( magnetostatic_tests )
+
+BOOST_AUTO_TEST_CASE( magnetostatic_magnetized_cylinder )
+{
+    // uniformly magnetized cylinder with mu_r = 1: B inside = mu0 M / 2, the test is repeated in metres and millimetres
+    for (double scale : {1.0, 1000.0}) {
+        MagnetostaticSimulation sim;
+        double a = 0.01 * scale, M = 1e6;
+        sim.mesh.drawing.drawCircle(Vector(0, 0), a, 120);
+        sim.mesh.drawing.drawRegion(Vector(0, 0), {0, {M, 0}, MU0});
+        auto system = sim.generateSystem(false, 1e-6 * scale * scale);
+        auto A = sim.solve(system);
+        auto B = sim.mesh.computeCurl(A);
+
+        auto& d = sim.mesh.data;
+        Vector acc = {0, 0};
+        double w = 0;
+        for (int i = 0; i < d.numberoftriangles; i++) {
+            if ((d.getElemBarycenter(i) + sim.mesh.center).norm() > 0.8 * a) continue;
+            acc += B[i] * d.getArea(i);
+            w += d.getArea(i);
+        }
+        BOOST_CHECK_CLOSE(acc.x / w, MU0 * M / 2, 0.5);
+        BOOST_CHECK_SMALL(acc.y / w, 1e-3);
+    }
+}
+
+BOOST_AUTO_TEST_CASE( magnetostatic_coax_linear )
+{
+    double I = 100;
+    for (double mu_r : {1.0, 1000.0}) {
+        MagnetostaticSimulation sim;
+        auto B = solveCoax(sim, {0, {0, 0}, mu_r * MU0}, I);
+        for (double r : {0.015, 0.02, 0.025}) {
+            BOOST_CHECK_CLOSE(ringAverageBtheta(sim, B, {0, 0}, r, 0.001), mu_r * MU0 * I / (2 * PI * r), 0.5);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE( magnetostatic_coax_nonlinear )
+{
+    // B in the gap must follow the BH curve at H = I / (2 pi r), the radii avoid the corners of the piecewise linear curve
+    double I = 400;
+    MagnetostaticSimulation sim;
+    auto B = solveCoax(sim, {0, {0, 0}, 0, magnetostatic_materials::iron}, I);
+    for (double r : {0.016, 0.02, 0.025}) {
+        double H = I / (2 * PI * r);
+        double Bexpected = H < 2000 ? H / 2000 : (H < 5000 ? 1 + 0.42 * (H - 2000) / 3000 : 1.42 + 0.28 * (H - 5000) / 5000);
+        BOOST_CHECK_CLOSE(ringAverageBtheta(sim, B, {0, 0}, r, 0.001), Bexpected, 0.5);
+    }
+}
+
+BOOST_AUTO_TEST_CASE( magnetostatic_off_center_wire )
+{
+    // a single wire carrying a net current, away from the center of the boundary: the return current is at infinity
+    double a = 0.01, I = 100;
+    Vector c0 = {0.3, -0.2};
+    MagnetostaticSimulation sim;
+    sim.mesh.drawing.drawCircle(c0, a, 120);
+    sim.mesh.drawing.drawCircle(c0 + Vector(0.05, 0), a, 120);
+    sim.mesh.drawing.drawRegion(c0, {I / (PI * a * a), {0, 0}, MU0});
+    sim.mesh.drawing.drawRegion(c0 + Vector(0.05, 0), {0, {0, 0}, MU0});
+    auto system = sim.generateSystem(false, 1e-6);
+    auto A = sim.solve(system);
+    auto B = sim.mesh.computeCurl(A);
+    for (double r : {0.015, 0.02}) {
+        BOOST_CHECK_CLOSE(ringAverageBtheta(sim, B, c0, r, 0.001), MU0 * I / (2 * PI * r), 0.5);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()

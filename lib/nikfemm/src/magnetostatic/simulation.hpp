@@ -48,7 +48,7 @@ namespace nikfemm {
             Vector computeForceIntegrals(std::vector<Vector> B, SurroundingRegionBlockIntegralAssets assets, Vector p);
             double computeTorqueIntegral(std::vector<Vector> B, SurroundingRegionBlockIntegralAssets assets, Vector p, Vector center);
         protected:
-            static void updateMu(std::vector<Vector> B, std::vector<const MagnetostaticProp*>& props, std::vector<double>& mu, double residual, uint32_t iter);
+            static void updateMu(const std::vector<Vector>& B, std::vector<const MagnetostaticProp*>& props, std::vector<double>& mu, double relaxation);
             auto getSurroundingRegionBlockIntegralAssets(std::vector<Vector> B, Vector p);
     };
 }
